@@ -286,13 +286,6 @@ pub(crate) unsafe fn wasmtime_fiber_init(
 
 /// Signs `r17` with the value in `r16` using either `paci{a,b}1716` depending
 /// on the platform.
-#[cfg(not(any(target_feature = "paca", target_feature = "pacg")))]
-fn paci1716(r17: *mut u8, _r16: *mut u8) -> *mut u8 {
-    // When PAuth isn't available we just return the pointer unchanged.
-    r17
-}
-
-#[cfg(any(target_feature = "paca", target_feature = "pacg"))]
 fn paci1716(mut r17: *mut u8, r16: *mut u8) -> *mut u8 {
     unsafe {
         core::arch::asm!(

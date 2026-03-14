@@ -20,16 +20,60 @@
 
 use core::arch::naked_asm;
 
-cfg_if::cfg_if! {
-    if #[cfg(target_vendor = "apple")] {
-        macro_rules! paci1716 { () => ("pacib1716\n"); }
-        macro_rules! pacisp { () => ("pacibsp\n"); }
-        macro_rules! autisp { () => ("autibsp\n"); }
-    } else {
-        macro_rules! paci1716 { () => ("pacia1716\n"); }
-        macro_rules! pacisp { () => ("paciasp\n"); }
-        macro_rules! autisp { () => ("autiasp\n"); }
-    }
+// Some ARM CPUs targetted by `aarch64-linux-android` do *not* support pointer
+// authentication (PAuth). Emitting PAuth instructions on those devices leads to
+// SIGILL. Only emit those instructions when the compiler is configured to enable
+// PAuth.
+
+// NOTE: rustc does not enable these features by default, even on platforms that
+// support PAuth (e.g. Apple Silicon). The build system can enable this via
+// `-C target-feature=+paca` (or `+pacg`).
+#[cfg(any(target_feature = "paca", target_feature = "pacg"))]
+macro_rules! pacisp {
+    () => {
+        "paciasp\n"
+    };
+}
+
+#[cfg(any(target_feature = "paca", target_feature = "pacg"))]
+macro_rules! autisp {
+    () => {
+        "autiasp\n"
+    };
+}
+
+#[cfg(all(
+    any(target_feature = "paca", target_feature = "pacg"),
+    target_vendor = "apple"
+))]
+macro_rules! paci1716 {
+    () => {
+        "pacib1716\n"
+    };
+}
+
+#[cfg(all(
+    any(target_feature = "paca", target_feature = "pacg"),
+    not(target_vendor = "apple")
+))]
+macro_rules! paci1716 {
+    () => {
+        "pacia1716\n"
+    };
+}
+
+#[cfg(not(any(target_feature = "paca", target_feature = "pacg")))]
+macro_rules! pacisp {
+    () => {
+        ""
+    };
+}
+
+#[cfg(not(any(target_feature = "paca", target_feature = "pacg")))]
+macro_rules! autisp {
+    () => {
+        ""
+    };
 }
 
 #[inline(never)] // FIXME(rust-lang/rust#148307)
@@ -160,6 +204,13 @@ pub(crate) unsafe fn wasmtime_fiber_init(
 
 /// Signs `r17` with the value in `r16` using either `paci{a,b}1716` depending
 /// on the platform.
+#[cfg(not(any(target_feature = "paca", target_feature = "pacg")))]
+fn paci1716(r17: *mut u8, _r16: *mut u8) -> *mut u8 {
+    // When PAuth isn't available we just return the pointer unchanged.
+    r17
+}
+
+#[cfg(any(target_feature = "paca", target_feature = "pacg"))]
 fn paci1716(mut r17: *mut u8, r16: *mut u8) -> *mut u8 {
     unsafe {
         core::arch::asm!(

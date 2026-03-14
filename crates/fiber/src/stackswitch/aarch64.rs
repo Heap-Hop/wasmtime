@@ -19,70 +19,97 @@
 //   `.cfi_window_save` assembler directive) informs an unwinder about this
 
 use core::arch::naked_asm;
+use core::sync::atomic::{AtomicU8, Ordering};
 
-// Some ARM CPUs targetted by `aarch64-linux-android` do *not* support pointer
-// authentication (PAuth). Emitting PAuth instructions on those devices leads to
-// SIGILL. Only emit those instructions when the compiler is configured to enable
-// PAuth.
+// Some ARM CPUs (especially on Android) do not support pointer authentication
+// (PAuth). Executing `pacia*` / `autiasp` on such CPUs causes a SIGILL crash.
+//
+// This implementation uses *runtime* detection and selects one of two paths:
+// * A PAuth-enabled fiber switch (emits `paciasp` / `autiasp`)
+// * A safe fallback that does not use PAuth
+//
+// The PAuth path is only executed on CPUs that actually support it.
 
-// NOTE: rustc does not enable these features by default, even on platforms that
-// support PAuth (e.g. Apple Silicon). The build system can enable this via
-// `-C target-feature=+paca` (or `+pacg`).
-#[cfg(any(target_feature = "paca", target_feature = "pacg"))]
-macro_rules! pacisp {
-    () => {
-        "paciasp\n"
-    };
-}
-
-#[cfg(any(target_feature = "paca", target_feature = "pacg"))]
-macro_rules! autisp {
-    () => {
-        "autiasp\n"
-    };
-}
-
-#[cfg(all(
-    any(target_feature = "paca", target_feature = "pacg"),
-    target_vendor = "apple"
-))]
+// These are the PAuth instructions used in the PAuth-enabled path.
+// The instructions are emitted unconditionally (so they can be tested by the
+// compiler), but they are only executed when the runtime check succeeds.
+#[cfg(target_vendor = "apple")]
 macro_rules! paci1716 {
     () => {
         "pacib1716\n"
     };
 }
 
-#[cfg(all(
-    any(target_feature = "paca", target_feature = "pacg"),
-    not(target_vendor = "apple")
-))]
+#[cfg(not(target_vendor = "apple"))]
 macro_rules! paci1716 {
     () => {
         "pacia1716\n"
     };
 }
 
-#[cfg(not(any(target_feature = "paca", target_feature = "pacg")))]
 macro_rules! pacisp {
     () => {
-        ""
+        "paciasp\n"
     };
 }
 
-#[cfg(not(any(target_feature = "paca", target_feature = "pacg")))]
 macro_rules! autisp {
     () => {
-        ""
+        "autiasp\n"
     };
+}
+
+// Cached result of the runtime PAuth detection:
+//   0 = no PAuth support
+//   1 = PAuth supported
+//   2 = unknown / not yet probed
+static PAUTH_SUPPORT: AtomicU8 = AtomicU8::new(2);
+
+fn has_pauth() -> bool {
+    match PAUTH_SUPPORT.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let supported = detect_pauth();
+            PAUTH_SUPPORT.store(if supported { 1 } else { 0 }, Ordering::Relaxed);
+            supported
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
+fn detect_pauth() -> bool {
+    unsafe {
+        let hwcap = libc::getauxval(libc::AT_HWCAP);
+        (hwcap & (libc::HWCAP_PACA | libc::HWCAP_PACG)) != 0
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+fn detect_pauth() -> bool {
+    // Apple silicon always supports PAuth.
+    true
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn detect_pauth() -> bool {
+    false
 }
 
 #[inline(never)] // FIXME(rust-lang/rust#148307)
 pub(crate) unsafe extern "C" fn wasmtime_fiber_switch(top_of_stack: *mut u8) {
-    unsafe { wasmtime_fiber_switch_(top_of_stack) }
+    if has_pauth() {
+        unsafe { wasmtime_fiber_switch_pauth(top_of_stack) }
+    } else {
+        unsafe { wasmtime_fiber_switch_nopauth(top_of_stack) }
+    }
 }
 
 #[unsafe(naked)]
-unsafe extern "C" fn wasmtime_fiber_switch_(top_of_stack: *mut u8 /* x0 */) {
+unsafe extern "C" fn wasmtime_fiber_switch_pauth(top_of_stack: *mut u8 /* x0 */) {
     naked_asm!(concat!(
         "
             .cfi_startproc
@@ -126,6 +153,57 @@ unsafe extern "C" fn wasmtime_fiber_switch_(top_of_stack: *mut u8 /* x0 */) {
             ldp x29, x30, [sp], 16
         ",
         autisp!(),
+        "
+            .cfi_window_save
+            ret
+            .cfi_endproc
+        ",
+    ));
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn wasmtime_fiber_switch_nopauth(top_of_stack: *mut u8 /* x0 */) {
+    naked_asm!(concat!(
+        "
+            .cfi_startproc
+        ",
+        "
+            .cfi_window_save
+            // Save all callee-saved registers on the stack since we're
+            // assuming they're clobbered as a result of the stack switch.
+            stp x29, x30, [sp, -16]!
+            stp x27, x28, [sp, -16]!
+            stp x25, x26, [sp, -16]!
+            stp x23, x24, [sp, -16]!
+            stp x21, x22, [sp, -16]!
+            stp x19, x20, [sp, -16]!
+            stp d14, d15, [sp, -16]!
+            stp d12, d13, [sp, -16]!
+            stp d10, d11, [sp, -16]!
+            stp d8, d9, [sp, -16]!
+
+            // Load our previously saved stack pointer to resume to, and save
+            // off our current stack pointer on where to come back to
+            // eventually.
+            ldr x8, [x0, -0x10]
+            mov x9, sp
+            str x9, [x0, -0x10]
+
+            // Switch to the new stack and restore all our callee-saved
+            // registers after the switch and return to our new stack.
+            mov sp, x8
+            ldp d8, d9, [sp], 16
+            ldp d10, d11, [sp], 16
+            ldp d12, d13, [sp], 16
+            ldp d14, d15, [sp], 16
+
+            ldp x19, x20, [sp], 16
+            ldp x21, x22, [sp], 16
+            ldp x23, x24, [sp], 16
+            ldp x25, x26, [sp], 16
+            ldp x27, x28, [sp], 16
+            ldp x29, x30, [sp], 16
+        ",
         "
             .cfi_window_save
             ret
@@ -194,7 +272,11 @@ pub(crate) unsafe fn wasmtime_fiber_init(
             // TODO: Use the PACGA instruction to authenticate the saved register
             // state, which avoids creating signed pointers to
             // wasmtime_fiber_start(), and provides wider coverage.
-            lr: paci1716(wasmtime_fiber_start as *mut u8, top_of_stack.sub(16)),
+            lr: if has_pauth() {
+                paci1716(wasmtime_fiber_start as *mut u8, top_of_stack.sub(16))
+            } else {
+                wasmtime_fiber_start as *mut u8
+            },
 
             last_sp: initial_stack.cast(),
             ..InitialStack::default()

@@ -19,40 +19,45 @@
 //   `.cfi_window_save` assembler directive) informs an unwinder about this
 
 use core::arch::naked_asm;
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 use core::sync::atomic::{AtomicU8, Ordering};
 
 // Some ARM CPUs (especially on Android) do not support pointer authentication
 // (PAuth). Executing `pacia*` / `autiasp` on such CPUs causes a SIGILL crash.
 //
-// This implementation uses *runtime* detection and selects one of two paths:
-// * A PAuth-enabled fiber switch (emits `paciasp` / `autiasp`)
-// * A safe fallback that does not use PAuth
+// This implementation uses platform-specific selection:
+// * Android always uses the non-PAuth fallback.
+// * Linux/aarch64 uses *runtime* detection and selects one of two paths.
+// * Other AArch64 platforms keep using the PAuth path.
 //
 // The PAuth path is only executed on CPUs that actually support it.
 
 // These are the PAuth instructions used in the PAuth-enabled path.
 // The instructions are emitted unconditionally (so they can be tested by the
 // compiler), but they are only executed when the runtime check succeeds.
-#[cfg(target_vendor = "apple")]
+#[cfg(all(not(target_os = "android"), target_vendor = "apple"))]
 macro_rules! paci1716 {
     () => {
         "pacib1716\n"
     };
 }
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(not(target_os = "android"), not(target_vendor = "apple")))]
 macro_rules! paci1716 {
     () => {
         "pacia1716\n"
     };
 }
 
+#[cfg(not(target_os = "android"))]
 macro_rules! pacisp {
     () => {
         "paciasp\n"
     };
 }
 
+#[cfg(not(target_os = "android"))]
 macro_rules! autisp {
     () => {
         "autiasp\n"
@@ -63,8 +68,10 @@ macro_rules! autisp {
 //   0 = no PAuth support
 //   1 = PAuth supported
 //   2 = unknown / not yet probed
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 static PAUTH_SUPPORT: AtomicU8 = AtomicU8::new(2);
 
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 fn has_pauth() -> bool {
     match PAUTH_SUPPORT.load(Ordering::Relaxed) {
         0 => false,
@@ -77,10 +84,31 @@ fn has_pauth() -> bool {
     }
 }
 
+#[cfg(target_os = "android")]
+fn has_pauth() -> bool {
+    false
+}
+
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+fn has_pauth() -> bool {
+    true
+}
+
 #[cfg(all(
     target_arch = "aarch64",
-    any(target_os = "linux", target_os = "android")
+    not(any(target_os = "linux", target_os = "android")),
+    not(target_vendor = "apple")
 ))]
+fn has_pauth() -> bool {
+    true
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn has_pauth() -> bool {
+    false
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 fn detect_pauth() -> bool {
     unsafe {
         let hwcap = libc::getauxval(libc::AT_HWCAP);
@@ -88,17 +116,13 @@ fn detect_pauth() -> bool {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-fn detect_pauth() -> bool {
-    // Apple silicon always supports PAuth.
-    true
+#[cfg(target_os = "android")]
+#[inline(never)] // FIXME(rust-lang/rust#148307)
+pub(crate) unsafe extern "C" fn wasmtime_fiber_switch(top_of_stack: *mut u8) {
+    unsafe { wasmtime_fiber_switch_nopauth(top_of_stack) }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
-fn detect_pauth() -> bool {
-    false
-}
-
+#[cfg(not(target_os = "android"))]
 #[inline(never)] // FIXME(rust-lang/rust#148307)
 pub(crate) unsafe extern "C" fn wasmtime_fiber_switch(top_of_stack: *mut u8) {
     if has_pauth() {
@@ -108,6 +132,7 @@ pub(crate) unsafe extern "C" fn wasmtime_fiber_switch(top_of_stack: *mut u8) {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 #[unsafe(naked)]
 unsafe extern "C" fn wasmtime_fiber_switch_pauth(top_of_stack: *mut u8 /* x0 */) {
     naked_asm!(concat!(
@@ -286,6 +311,12 @@ pub(crate) unsafe fn wasmtime_fiber_init(
 
 /// Signs `r17` with the value in `r16` using either `paci{a,b}1716` depending
 /// on the platform.
+#[cfg(target_os = "android")]
+fn paci1716(r17: *mut u8, _r16: *mut u8) -> *mut u8 {
+    r17
+}
+
+#[cfg(not(target_os = "android"))]
 fn paci1716(mut r17: *mut u8, r16: *mut u8) -> *mut u8 {
     unsafe {
         core::arch::asm!(

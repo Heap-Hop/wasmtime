@@ -20,15 +20,27 @@
 
 use core::arch::naked_asm;
 
+// Keep this structure aligned with the rest of the runtime's AArch64 codegen.
+// Apple always uses PAuth and the B-key for return addresses. Elsewhere we
+// only emit the PAuth instructions when the target enables pointer
+// authentication features; otherwise these definitions intentionally become
+// empty and the stack-switch path omits return-address signing entirely.
 cfg_if::cfg_if! {
     if #[cfg(target_vendor = "apple")] {
         macro_rules! paci1716 { () => ("pacib1716\n"); }
         macro_rules! pacisp { () => ("pacibsp\n"); }
         macro_rules! autisp { () => ("autibsp\n"); }
-    } else {
+        macro_rules! cfi_window_save { () => (".cfi_window_save\n"); }
+    } else if #[cfg(any(target_feature = "paca", target_feature = "pacg"))] {
         macro_rules! paci1716 { () => ("pacia1716\n"); }
         macro_rules! pacisp { () => ("paciasp\n"); }
         macro_rules! autisp { () => ("autiasp\n"); }
+        macro_rules! cfi_window_save { () => (".cfi_window_save\n"); }
+    } else {
+        macro_rules! paci1716 { () => (""); }
+        macro_rules! pacisp { () => (""); }
+        macro_rules! autisp { () => (""); }
+        macro_rules! cfi_window_save { () => (""); }
     }
 }
 
@@ -45,7 +57,9 @@ unsafe extern "C" fn wasmtime_fiber_switch_(top_of_stack: *mut u8 /* x0 */) {
         ",
         pacisp!(),
         "
-            .cfi_window_save
+        ",
+        cfi_window_save!(),
+        "
             // Save all callee-saved registers on the stack since we're
             // assuming they're clobbered as a result of the stack switch.
             stp x29, x30, [sp, -16]!
@@ -83,7 +97,9 @@ unsafe extern "C" fn wasmtime_fiber_switch_(top_of_stack: *mut u8 /* x0 */) {
         ",
         autisp!(),
         "
-            .cfi_window_save
+        ",
+        cfi_window_save!(),
+        "
             ret
             .cfi_endproc
         ",
@@ -133,24 +149,16 @@ pub(crate) unsafe fn wasmtime_fiber_init(
             x20: entry_point as *mut u8,
             x21: entry_arg0,
 
-            // We set up the newly initialized fiber, so that it resumes
-            // execution from wasmtime_fiber_start(). As a result, we need a
-            // signed address of this function because `wasmtime_fiber_switch`
-            // ends with a `auti{a,b}sp` instruction. There are 2 requirements:
-            // * We would like to use an instruction that is executed as a no-op
-            //   by processors that do not support PAuth, so that the code is
-            //   backward-compatible and there is no duplication; `PACIA1716` is
-            //   a suitable one.
-            // * The fiber stack pointer value that is used by the signing
-            //   operation must match the value when the pointer is
-            //   authenticated inside wasmtime_fiber_switch(), which is 16 bytes
-            //   below the `top_of_stack` which will be `sp` at the time of the
-            //   `auti{a,b}sp`.
+            // We set up the newly initialized fiber so that it resumes
+            // execution from wasmtime_fiber_start(). When pointer
+            // authentication is enabled for this target we must pre-sign that
+            // address to match the `paci{a,b}sp`/`auti{a,b}sp` pair used in the
+            // stack-switch routine.
             //
             // TODO: Use the PACGA instruction to authenticate the saved register
             // state, which avoids creating signed pointers to
             // wasmtime_fiber_start(), and provides wider coverage.
-            lr: paci1716(wasmtime_fiber_start as *mut u8, top_of_stack.sub(16)),
+            lr: sign_lr(wasmtime_fiber_start as *mut u8, top_of_stack.sub(16)),
 
             last_sp: initial_stack.cast(),
             ..InitialStack::default()
@@ -160,7 +168,7 @@ pub(crate) unsafe fn wasmtime_fiber_init(
 
 /// Signs `r17` with the value in `r16` using either `paci{a,b}1716` depending
 /// on the platform.
-fn paci1716(mut r17: *mut u8, r16: *mut u8) -> *mut u8 {
+fn sign_lr(mut r17: *mut u8, r16: *mut u8) -> *mut u8 {
     unsafe {
         core::arch::asm!(
             paci1716!(),
@@ -187,7 +195,9 @@ unsafe extern "C" fn wasmtime_fiber_start() -> ! {
             0x23, 0xa0, 0x1  /* DW_OP_plus_uconst 0xa0 */
         .cfi_rel_offset x30, -0x08
         .cfi_rel_offset x29, -0x10
-        .cfi_window_save
+        ",
+        cfi_window_save!(),
+        "
         .cfi_rel_offset x28, -0x18
         .cfi_rel_offset x27, -0x20
         .cfi_rel_offset x26, -0x28
